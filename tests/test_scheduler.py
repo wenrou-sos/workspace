@@ -9,6 +9,10 @@ from mic_scheduler.pool import charge_one_minute as pool_tick, USABLE_SOC
 from mic_scheduler.engine import simulate, do_swap
 from mic_scheduler.planner import SwapPlanner
 from mic_scheduler.monitor import Monitor, AlertLevel
+from mic_scheduler.report import (DispatchReporter, render_snapshot,
+                                  render_report, TRIGGER_INITIAL,
+                                  TRIGGER_AD_HOC_SWAP, TRIGGER_DRAIN_SPIKE)
+import json
 
 
 def mic(mid, soc, start=0, end=600, health=1.0, state=MicState.IN_USE):
@@ -242,6 +246,195 @@ class MonitorTest(unittest.TestCase):
         sc.now = 0  # 距高峰 30 分钟，只有 1 块满电（要求 2）
         alerts = Monitor().check(sc)
         self.assertTrue(any("备电" in a.text for a in alerts))
+
+
+def _replan_snapshot(mics, spares=(), trigger=TRIGGER_INITIAL,
+                     now=0, horizon=600, peak=(), slots=2, note="",
+                     reporter=None, alerts=()):
+    """构造场景 -> 重排 -> 留存快照，返回 (scene, plan, advisories, reporter, snapshot)。"""
+    sc = scene(mics, spares=spares, slots=slots, horizon=horizon,
+               peak=peak, now=now)
+    if reporter is None:
+        reporter = DispatchReporter(sc)
+    for a in alerts:
+        reporter.record_alert(a)
+    plan, adv = SwapPlanner().replan(sc)
+    snap = reporter.record_replan(sc, plan, adv, trigger, note)
+    return sc, plan, adv, reporter, snap
+
+
+class ReportTest(unittest.TestCase):
+    def test_snapshot_contains_all_sections(self):
+        """报告快照包含场景时间/TTE/计划(原因+阈值)/校验统计。"""
+        sc, plan, _, _, snap = _replan_snapshot(
+            [mic("A", 0.20, end=480), mic("B", 0.30, end=480)],
+            spares=(1.0, 1.0), slots=2, horizon=480)
+        self.assertEqual(snap.seq, 1)
+        self.assertEqual(snap.trigger, TRIGGER_INITIAL)
+        self.assertEqual(snap.generated_at.absolute, 0)
+        self.assertEqual(snap.generated_at.relative, 0)
+        self.assertEqual(snap.horizon.absolute, 480)
+        self.assertEqual(snap.horizon.relative, 480)
+        # 两支麦都有 TTE 预测
+        by_mic = {f.mic_id: f for f in snap.forecasts}
+        self.assertIn("A", by_mic)
+        self.assertIsNotNone(by_mic["A"].tte_relative)
+        self.assertFalse(by_mic["A"].initial_dead)
+        # 计划条目带原因与备电阈值
+        self.assertTrue(snap.plan)
+        self.assertTrue(all(e.reason and e.min_spare_soc > 0
+                            for e in snap.plan))
+        # 计划可执行：零断电、零落空
+        self.assertEqual(snap.validated_outages, 0)
+        self.assertEqual(snap.validated_failed, 0)
+        self.assertEqual(snap.unresolved, [])
+
+    def test_time_dual_track_absolute_and_relative(self):
+        """now=100 时生成快照：绝对分钟与相对分钟必须同时给出且相差 100。"""
+        m = mic("A", 0.20, start=100, end=400)
+        sc = scene([m], spares=(1.0,), slots=1, horizon=400, now=100)
+        reporter = DispatchReporter(sc)
+        plan, adv = SwapPlanner().replan(sc)
+        snap = reporter.record_replan(sc, plan, adv, TRIGGER_AD_HOC_SWAP)
+        for e in snap.plan:
+            self.assertEqual(e.time.absolute - e.time.relative, 100)
+            self.assertGreaterEqual(e.time.absolute, 100)
+        f = next(f for f in snap.forecasts if f.mic_id == "A")
+        self.assertEqual(f.tte_absolute - f.tte_relative, 100)
+
+    def test_initial_dead_forecast_and_unresolved(self):
+        """开班即断电且无可用备电：TTE 相对为 0、initial_dead=True、列入未解决。"""
+        _, plan, adv, _, snap = _replan_snapshot(
+            [mic("DEAD", 0.0, end=600)], spares=(0.02,), slots=1)
+        self.assertEqual(plan, [])
+        f = snap.forecasts[0]
+        self.assertTrue(f.initial_dead)
+        self.assertEqual(f.tte_relative, 0)
+        self.assertEqual(f.related_swap, None)
+        self.assertEqual(len(snap.unresolved), 1)
+        u = snap.unresolved[0]
+        self.assertEqual(u.mic_id, "DEAD")
+        self.assertTrue(u.initial_dead and u.outage)
+        self.assertEqual(u.outage_time.absolute, 0)
+        self.assertGreaterEqual(snap.validated_outages, 1)
+        # 渲染文本保留"截止电压"与初始断电标记
+        text = render_snapshot(snap)
+        self.assertIn("截止电压", text)
+        self.assertIn("开班已低于截止电压", text)
+
+    def test_failure_snapshot_is_retained_not_dropped(self):
+        """无备电失败场景的快照也必须留存，且终稿包含全部快照。"""
+        reporter = None
+        _, _, _, reporter, s1 = _replan_snapshot(
+            [mic("A", 0.0, end=600)], spares=(), slots=1, reporter=reporter)
+        _, _, _, reporter, s2 = _replan_snapshot(
+            [mic("A", 0.0, end=600)], spares=(1.0,), slots=1,
+            trigger=TRIGGER_AD_HOC_SWAP, note="补来一块满电", reporter=reporter)
+        report = reporter.finalize(
+            scene([mic("A", 0.0, end=600)], spares=(1.0,), slots=1))
+        self.assertEqual(len(report.snapshots), 2)
+        self.assertEqual(report.snapshots[0].seq, 1)
+        self.assertTrue(report.snapshots[0].unresolved)  # 失败快照保留
+        self.assertEqual(report.snapshots[1].validated_outages, 0)
+
+    def test_replan_diff_detects_shift_added_removed(self):
+        """临时换机后重排：差异要识别时刻位移、新增、取消（按绝对分钟对齐）。"""
+        mics = lambda: [mic("A", 0.15, end=600), mic("B", 0.45, end=600)]
+        sc = scene(mics(), spares=(1.0, 0.9), slots=2, horizon=600)
+        reporter = DispatchReporter(sc)
+        p1, _ = SwapPlanner().replan(sc)
+        s1 = reporter.record_replan(sc, p1, [], TRIGGER_INITIAL)
+
+        ok, _ = do_swap(sc, 10, "A", USABLE_SOC)
+        self.assertTrue(ok)
+        sc.now = 10
+        p2, _ = SwapPlanner().replan(sc)
+        s2 = reporter.record_replan(sc, p2, [], TRIGGER_AD_HOC_SWAP,
+                                    "A 客人要求提前换机")
+
+        d = reporter.diff(s1, s2)
+        # A 被临时换机救走：它原来的换电条目必然取消或位移
+        a_changes = [c for c in d.changed if c["mic_id"] == "A"]
+        a_removed = [e for e in d.removed if e.mic_id == "A"]
+        self.assertTrue(a_changes or a_removed)
+        # 差异里所有时间均为绝对分钟
+        for c in d.changed:
+            self.assertIn("shift_minutes", c)
+            self.assertEqual(c["new"]["absolute"] - c["old"]["absolute"],
+                             c["shift_minutes"])
+
+    def test_drain_spike_moves_swap_earlier(self):
+        """耗电突增后重排：同一支麦的换电时刻应提前（shift 为负）。"""
+        m = mic("A", 0.50, end=600)
+        sc = scene([m, mic("B", 0.90, end=600)],
+                   spares=(1.0, 1.0, 1.0), slots=3, horizon=600)
+        reporter = DispatchReporter(sc)
+        p1, _ = SwapPlanner().replan(sc)
+        s1 = reporter.record_replan(sc, p1, [], TRIGGER_INITIAL)
+        before = next(e.time.absolute for e in s1.plan if e.mic_id == "A")
+
+        sc.now = 100
+        sc.mic("A").drain_scale = 3.0
+        p2, _ = SwapPlanner().replan(sc)
+        s2 = reporter.record_replan(sc, p2, [], TRIGGER_DRAIN_SPIKE)
+        after_entries = [e for e in s2.plan if e.mic_id == "A"]
+        self.assertTrue(after_entries)
+        self.assertLess(after_entries[0].time.absolute, before + 100)
+        # 快照历史均保留
+        self.assertEqual(len(reporter.finalize(sc).snapshots), 2)
+
+    def test_alert_linked_to_swap_action(self):
+        """设备级预警应关联到该麦的首次换电条目（related_alert 非空）。"""
+        from mic_scheduler.monitor import Alert, AlertLevel
+        sc = scene([mic("A", 0.10, end=600)], spares=(1.0,), slots=1)
+        reporter = DispatchReporter(sc)
+        reporter.record_alert(Alert(0, AlertLevel.CRITICAL,
+                                    "A 预计 25 分钟后断电",
+                                    mic_id="A", source="mic"))
+        plan, adv = SwapPlanner().replan(sc)
+        snap = reporter.record_replan(sc, plan, adv, TRIGGER_INITIAL)
+        entry = next(e for e in snap.plan if e.mic_id == "A")
+        self.assertIsNotNone(entry.related_alert)
+        self.assertIn("A", entry.related_alert)
+        forecast = next(f for f in snap.forecasts if f.mic_id == "A")
+        self.assertIsNotNone(forecast.related_swap)
+
+    def test_report_json_export_roundtrip(self):
+        """终稿报告可导出 JSON，结构含全部必需字段且可反序列化。"""
+        import tempfile, os
+        # A 开班即低电且池中只有死电：校验确实在第 0 分钟断电
+        sc, _, _, reporter, _ = _replan_snapshot(
+            [mic("A", 0.0, end=300)], spares=(0.02,), slots=1, horizon=300,
+            peak=((200, 300),))
+        reporter.record_outage(0, "A", 0)  # 开班已断电
+        report = reporter.finalize(sc)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "r.json")
+            report.to_json(path)
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        for key in ("scene_start", "horizon", "peak_bands", "finalized_at",
+                    "snapshots", "outages", "alerts"):
+            self.assertIn(key, data)
+        self.assertEqual(data["outages"][0]["mic_id"], "A")
+        self.assertEqual(data["outages"][0]["initial"], True)
+        # 无可用备电 -> 无计划但快照仍留存，时间字段双轨一致
+        snap0 = data["snapshots"][0]
+        self.assertEqual(snap0["plan"], [])
+        self.assertEqual(snap0["generated_at"]["absolute"],
+                         snap0["generated_at"]["relative"])
+
+    def test_render_report_has_outage_stats(self):
+        """终稿文本含断电统计（开班/营业中分类）与全部快照清单。"""
+        sc, _, _, reporter, _ = _replan_snapshot(
+            [mic("A", 0.0, end=300)], spares=(0.02,), slots=1, horizon=300)
+        # 校验中断电发生在第 0 分钟（开班即死），手动登记实际断电
+        reporter.record_outage(0, "A", 0)
+        text = render_report(reporter.finalize(sc))
+        self.assertIn("最终断电统计", text)
+        self.assertIn("开班已断电 1 起", text)
+        self.assertIn("重排记录", text)
+        self.assertIn("未解决的备电不足", text)
 
 
 if __name__ == "__main__":

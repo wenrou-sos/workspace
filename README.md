@@ -7,8 +7,9 @@
 ## 快速运行
 
 ```bash
-python3 -m mic_scheduler.demo              # 端到端演示（含 3 类突发事件）
-python3 -m unittest discover -s tests -v   # 单元测试（15 个）
+python3 -m mic_scheduler.demo                    # 端到端演示（含 3 类突发事件）
+python3 -m mic_scheduler.demo report.json        # 同上，并导出结构化调度报告 JSON
+python3 -m unittest discover -s tests -v         # 单元测试（30 个）
 ```
 
 ## 演示场景
@@ -59,6 +60,22 @@ python3 -m unittest discover -s tests -v   # 单元测试（15 个）
 - 预警去重，临时换机后该麦允许重新触发（状态变了，旧预警失效）；
 - 计划器另有"30 分钟内 ≥3 次换机"的集中度提示。
 
+### 5. 调度报告（复核 / 归档 / 前后对比）—— `report.py`
+- **每次重排都留存一份快照**（开班初始、临时换机、换机身、耗电突增，以及
+  无备电失败的场景都不丢弃），终稿汇总为一份结构化 `DispatchReport`；
+- 快照统一包含：场景时间（绝对分钟/钟点）、每支麦的 TTE（**绝对分钟 +
+  距当前相对分钟双轨**，开班即断电显示"立即处理"）、换电计划的原因与备电
+  阈值、未解决的备电不足（以计划完整快放后是否真的断电为准）、校验断电/
+  落空统计；
+- **预警 ↔ 换电动作可关联**：设备级预警带 `mic_id`，对应计划条目下直接挂出
+  最近一条预警文本；
+- `DispatchReporter.diff(旧快照, 新快照)` 按 `(麦, 绝对分钟)` 对齐，给出
+  临时换机/耗电突增前后的换机时刻**位移、新增、取消**（绝对分钟对齐，
+  不受 `now` 漂移影响）；
+- 终稿含最终断电统计（区分"开班已断电"与"营业中断电"）；
+- 文本渲染 `render_snapshot` / `render_report` 供终端复核，
+  `report.to_json(path)` 导出归档（`python -m mic_scheduler.demo report.json`）。
+
 ## 代码结构
 
 ```
@@ -69,6 +86,7 @@ mic_scheduler/
 ├── engine.py    # 离散时间推进、换机、断电登记、计划校验快放
 ├── planner.py   # 换电计划：影子重放 + EDF 贪心 + 时段成本评分 + 三档兜底
 ├── monitor.py   # 低电量/备电不足预警（去重 + 换机后重置）
+├── report.py    # 结构化调度报告：重排快照留存、前后差异、预警-换电关联、JSON 导出
 └── demo.py      # 晚市场景端到端演示（含临时换机/换机身/耗电突增）
 tests/
 └── test_scheduler.py

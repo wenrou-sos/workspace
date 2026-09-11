@@ -24,6 +24,9 @@ class Alert:
     minute: int
     level: str               # CRITICAL / WARNING
     text: str
+    mic_id: str | None = None    # 设备级预警携带 mic_id，供调度报告关联换电动作；
+                                 # 充电池库存类预警为 None
+    source: str = "mic"          # mic（单麦断电风险）/ pool（备电库存不足）
 
 
 class AlertLevel:
@@ -65,7 +68,8 @@ class Monitor:
                     f"{mic.mic_id} 预计 {remain:.0f} 分钟后断电"
                     f"（当前 {mic.battery.soc:.0%}，"
                     f"健康度 {mic.battery.health:.0%}，"
-                    f"耗电系数 {mic.drain_scale:.1f}x）"))
+                    f"耗电系数 {mic.drain_scale:.1f}x）",
+                    mic_id=mic.mic_id, source="mic"))
 
         # 2) 备电库存
         ready = scene.pool.ready_count(USABLE_SOC)
@@ -79,5 +83,6 @@ class Monitor:
                 wait_txt = f"，下一批备电约 {wait} 分钟后可用" if wait else ""
                 alerts.append(Alert(
                     scene.now, AlertLevel.WARNING,
-                    f"满电备电仅 {ready} 块（高峰要求 {SPARES_NEEDED}）{wait_txt}"))
+                    f"满电备电仅 {ready} 块（高峰要求 {SPARES_NEEDED}）{wait_txt}",
+                    source="pool"))
         return alerts

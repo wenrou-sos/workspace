@@ -8,12 +8,17 @@
 """
 from __future__ import annotations
 
-from .battery import time_to_empty, CUTOFF_SOC
+import sys
+
+from .battery import CUTOFF_SOC
 from .models import (Battery, Microphone, UsageSegment, MicState,
                      ChargingPool, Scene, SLOT_READINESS)
 from .engine import do_swap, step
 from .planner import SwapPlanner
 from .monitor import Monitor
+from .report import (DispatchReporter, render_snapshot, render_report,
+                     TRIGGER_INITIAL, TRIGGER_AD_HOC_SWAP,
+                     TRIGGER_DEVICE_REPLACE, TRIGGER_DRAIN_SPIKE)
 
 OPEN = 18 * 60       # 仿真从 17:00 开始，18:00 开门
 CLOSE = 26 * 60      # 凌晨 02:00
@@ -59,33 +64,25 @@ def build_scene() -> Scene:
     return Scene(mics, pool, CLOSE, PEAK, now=START)
 
 
-def print_plan(scene: Scene, plan, advisories, title: str) -> None:
-    print(f"\n=== {title} ===")
-    if not plan:
-        print("  无需换电")
-    for s in plan:
-        tte = time_to_empty(scene.mic(s.mic_id), s.time, scene.horizon)
-        tag = " [高峰!]" if any(a <= s.time < b for a, b in scene.peak_bands) else ""
-        forced = " [强制]" if s.forced else ""
-        left = f"{tte:.0f} 分钟后将断电" if tte is not None else "打烊前不断电"
-        print(f"  {hhmm(s.time)}  {s.mic_id}  ({s.reason}, 备电≥{s.min_spare_soc:.0%})"
-              f"  换时{left}{tag}{forced}")
-    for a in advisories:
-        print(f"  提示: {a}")
-
-
-def run_demo() -> None:
+def run_demo(export_path: str | None = None) -> None:
     scene = build_scene()
     planner = SwapPlanner()
     monitor = Monitor()
-    plan, advisories = planner.replan(scene)
-    print_plan(scene, plan, advisories,
-               f"开班前计划（{hhmm(START)} 生成）：共 {len(plan)} 次换电")
+    # 报告器：留存每次重排快照、预警、断电，供调度员事后复核 / 导出
+    reporter = DispatchReporter(scene, day_start_hour=0)
+
+    def replan_and_report(trigger: str, note: str = ""):
+        """重排 -> 留存结构化快照 -> 打印快照 -> 返回 (计划, 提示)。"""
+        plan, advisories = planner.replan(scene)
+        snap = reporter.record_replan(scene, plan, advisories, trigger, note)
+        print("\n" + render_snapshot(snap))
+        return plan, advisories
+
+    plan, advisories = replan_and_report(
+        TRIGGER_INITIAL, f"{hhmm(START)} 开班前生成")
 
     timeline: list[tuple[int, str]] = []
     planned_done: set[tuple[int, str]] = set()
-    alerts_seen: list[tuple[int, str, str]] = []
-    outages: list[tuple[int, str]] = []
 
     for minute in range(START, CLOSE):
         scene.now = minute
@@ -100,10 +97,9 @@ def run_demo() -> None:
                 kind = "满电" if threshold == 0.8 else "电量最高的备电"
                 timeline.append((minute,
                     f"临时换机 M2 -> {uid}（客人提前要求，{kind}）"))
-                plan, advisories = planner.replan(scene)
                 monitor.reset_dedup("M2")
-                print_plan(scene, plan, advisories,
-                           f"{hhmm(minute)} 临时换机后重排")
+                plan, advisories = replan_and_report(
+                    TRIGGER_AD_HOC_SWAP, f"M2 临时更换为 {uid}（{kind}）")
 
         # --- 突发事件 2：设备故障，整支换掉（电池不换，转移到备用机身） ---
         if minute == EVENT_REPLACE:
@@ -114,20 +110,18 @@ def run_demo() -> None:
             scene.pool.accept(old.battery, minute)
             scene.mics = [m for m in scene.mics if m.mic_id != "M6"] + [spare_body]
             timeline.append((minute, "M6 机身故障 -> 启用备用机身 M6'（电池转移，计划迁移）"))
-            plan, advisories = planner.replan(scene)
             monitor.reset_dedup("M6")
-            print_plan(scene, plan, advisories,
-                       f"{hhmm(minute)} 更换机身后重排")
+            plan, advisories = replan_and_report(
+                TRIGGER_DEVICE_REPLACE, "M6 -> M6'（电池转移，计划迁移）")
 
         # --- 突发事件 3：M5 电池老化突发放电 ---
         if minute == EVENT_SPIKE:
             m5 = scene.mic("M5")
             m5.drain_scale = 2.2
             timeline.append((minute, "M5 电池异常发热、放电加速（2.2x）"))
-            plan, advisories = planner.replan(scene)
             monitor.reset_dedup("M5")
-            print_plan(scene, plan, advisories,
-                       f"{hhmm(minute)} 耗电突增后重排")
+            plan, advisories = replan_and_report(
+                TRIGGER_DRAIN_SPIKE, "M5 耗电系数 -> 2.2x")
 
         # --- 计划内换电 ---
         for s in plan:
@@ -144,30 +138,26 @@ def run_demo() -> None:
         step(scene, minute)
         for mic in scene.mics:
             if mic.dead_at == minute:
-                outages.append((minute, mic.mic_id))
+                reporter.record_outage(minute, mic.mic_id, minute)
                 timeline.append((minute, f"⛡ {mic.mic_id} 已断电！"))
         for alert in monitor.check(scene):
-            alerts_seen.append((minute, alert.level, alert.text))
+            reporter.record_alert(alert)
 
-    _print_timeline(timeline, alerts_seen, outages)
+    _print_timeline(timeline)
     _print_stats(scene, plan)
 
+    # ---- 终稿调度报告：打印 + 可选导出 JSON ----
+    report = reporter.finalize(scene)
+    print("\n" + render_report(report))
+    if export_path:
+        report.to_json(export_path)
+        print(f"调度报告已导出: {export_path}")
 
-def _print_timeline(timeline, alerts, outages) -> None:
+
+def _print_timeline(timeline) -> None:
     print("\n=== 关键事件时间线 ===")
     for minute, text in timeline:
         print(f"  {hhmm(minute)}  {text}")
-
-    print("\n=== 低电量预警（去重后）===")
-    for minute, level, text in alerts:
-        print(f"  {hhmm(minute)}  [{level}] {text}")
-
-    print("\n=== 断电统计 ===")
-    if outages:
-        for minute, mic_id in outages:
-            print(f"  ✗ {hhmm(minute)}  {mic_id} 营业中断电")
-    else:
-        print("  ✓ 全场无营业中断电")
 
 
 def _print_stats(scene: Scene, plan) -> None:
@@ -184,4 +174,6 @@ def _print_stats(scene: Scene, plan) -> None:
 
 
 if __name__ == "__main__":
-    run_demo()
+    # 用法: python -m mic_scheduler.demo [报告JSON导出路径]
+    export = sys.argv[1] if len(sys.argv) > 1 else None
+    run_demo(export)
