@@ -41,13 +41,19 @@ def charge_one_minute(b: Battery) -> None:
     b.soc = min(FULL_SOC, b.soc + rate)
 
 
-def time_to_empty(mic: Microphone, start: int, horizon: int) -> float | None:
+def time_to_empty(mic: Microphone, start: int, horizon: int,
+                  soc: float | None = None) -> float | None:
     """预计耗尽时间。
 
     从 start 分钟开始，严格按未来使用计划逐分钟积分，返回 soc 跌到
     CUTOFF_SOC 的分钟数（可为小数）；horizon 内不会断电则返回 None。
+
+    soc 为 start 时刻的（假设）电量；默认取电池当前电量——因此调用方
+    若传入未来的 start，必须先用 :func:`predict_soc` 推出该时刻电量再
+    传入，否则会漏掉 start 之前的耗电、高估续航。
     """
-    soc = mic.battery.soc
+    if soc is None:
+        soc = mic.battery.soc
     if soc <= CUTOFF_SOC:
         # 起始时刻已经低于保护截止电压：TTE 为 0（不返回负值/过去时刻）
         return float(start)

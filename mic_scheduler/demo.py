@@ -94,6 +94,7 @@ def run_demo(export_path: str | None = None) -> None:
             threshold = 0.8 if scene.pool.ready_count(0.8) else CUTOFF_SOC
             ok, uid = do_swap(scene, minute, "M2", threshold)
             if ok:
+                reporter.mark_rescued("M2")
                 kind = "满电" if threshold == 0.8 else "电量最高的备电"
                 timeline.append((minute,
                     f"临时换机 M2 -> {uid}（客人提前要求，{kind}）"))
@@ -130,6 +131,7 @@ def run_demo(export_path: str | None = None) -> None:
                 ok, uid = do_swap(scene, minute, s.mic_id,
                                   CUTOFF_SOC if s.forced else s.min_spare_soc)
                 if ok:
+                    reporter.mark_rescued(s.mic_id)
                     timeline.append((minute, f"计划换机 {s.mic_id} -> {uid}（{s.reason}）"))
                 else:
                     timeline.append((minute, f"✗ {s.mic_id} 换机失败：无任何备电"))
@@ -138,7 +140,7 @@ def run_demo(export_path: str | None = None) -> None:
         step(scene, minute)
         for mic in scene.mics:
             if mic.dead_at == minute:
-                reporter.record_outage(minute, mic.mic_id, minute)
+                reporter.record_outage(minute, mic.mic_id)
                 timeline.append((minute, f"⛡ {mic.mic_id} 已断电！"))
         for alert in monitor.check(scene):
             reporter.record_alert(alert)

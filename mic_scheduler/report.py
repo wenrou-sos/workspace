@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 
-from .battery import time_to_empty, CUTOFF_SOC
+from .battery import time_to_empty, predict_soc, CUTOFF_SOC
 from .engine import clone_scene, simulate
 from .models import Scene, PlannedSwap
 from .monitor import Alert
@@ -53,7 +53,9 @@ class PlanEntryView:
     reason: str
     min_spare_soc: float
     forced: bool
-    tte_at_swap: float | None      # 不换电时该时刻的预计断电剩余分钟（可空）
+    tte_at_swap: float | None      # 若不换电，到换电时刻还剩多少分钟断电
+                                   # （非负：绝对断电时刻 - 换电时刻）；
+                                   # 0 = 换电时已在截止电压；None = 打烊前不断电
     related_alert: str | None = None   # 关联的最近一条该麦预警文本
 
 
@@ -177,6 +179,9 @@ class DispatchReporter:
         # 开班时已经低于截止电压的麦（用于断电分类）
         self._initial_dead = {m.mic_id for m in scene.mics
                               if m.battery.soc <= CUTOFF_SOC}
+        # 已经被成功换电救起过的麦：获救之后的任何再次断电都属于
+        # "营业中断电"，不能再归类为开班初始故障
+        self._ever_rescued: set[str] = set()
 
     # ---- 时间工具 ----
     def _tref(self, minute: int, now: int) -> TimeRef:
@@ -192,16 +197,32 @@ class DispatchReporter:
     def record_alert(self, alert: Alert) -> None:
         self._alerts.append(alert)
 
+    def mark_rescued(self, mic_id: str) -> None:
+        """登记该麦已成功换入可开机的电池（获救）。
+
+        获救后再次跌破截止电压属于"营业中断电"，不再算开班初始故障。
+        由执行侧在每次成功换电（含临时换机）后调用。
+        """
+        self._ever_rescued.add(mic_id)
+
     def record_outage(self, minute: int, mic_id: str,
-                      now: int) -> OutageRecord:
-        """登记一次实际断电；initial=True 表示该麦开班时就已低于截止电压。"""
+                      now: int | None = None) -> OutageRecord:
+        """登记一次实际断电。
+
+        分类规则（按实际发生阶段，而非只看编号）：
+        - 开班即低于截止电压、且从未被救起 -> ``initial=True``；
+        - 曾成功换电后再次跌破 / 运营中自然耗尽 -> ``initial=False``。
+        ``now`` 仅用于相对时间展示，不参与初始判定（此前"事件分钟同时
+        作为当前时间"导致任何后续断电都满足初始条件）。
+        """
         key = (minute, mic_id)
         if key in self._outage_keys:
             return next(o for o in self._outages
                         if (o.time.absolute, o.mic_id) == key)
-        rec = OutageRecord(self._tref(minute, now), mic_id,
-                           initial=mic_id in self._initial_dead
-                           and minute <= now)
+        is_initial = (mic_id in self._initial_dead
+                      and mic_id not in self._ever_rescued)
+        rec = OutageRecord(self._tref(minute, now if now is not None else minute),
+                           mic_id, initial=is_initial)
         self._outage_keys.add(key)
         self._outages.append(rec)
         return rec
@@ -251,16 +272,23 @@ class DispatchReporter:
         # 计划条目视图
         entries: list[PlanEntryView] = []
         for s in sorted(plan, key=lambda x: (x.time, x.mic_id)):
-            tte_at = time_to_empty(scene.mic(s.mic_id), s.time,
-                                   scene.horizon)
+            # 剩余 = 绝对断电时刻 - 换电时刻，恒为非负。先推演到换电时刻
+            # 的真实电量，再算 TTE——直接用当前电量会漏掉 now->换电时刻
+            # 的耗电、高估续航。起始已低于截止电压 -> 剩余 0；打烊前不断
+            # 电 -> None。
+            target = scene.mic(s.mic_id)
+            soc_at_swap = predict_soc(target, now, s.time)
+            tte_at = time_to_empty(target, s.time, scene.horizon,
+                                   soc=soc_at_swap)
+            remaining = (round(max(0.0, tte_at - s.time), 1)
+                         if tte_at is not None else None)
             entries.append(PlanEntryView(
                 time=self._tref(s.time, now),
                 mic_id=s.mic_id,
                 reason=s.reason,
                 min_spare_soc=s.min_spare_soc,
                 forced=s.forced,
-                tte_at_swap=(round(s.time - tte_at, 1)
-                             if tte_at is not None else None),
+                tte_at_swap=remaining,
                 related_alert=latest_alert.get(s.mic_id),
             ))
 
@@ -437,9 +465,16 @@ def render_snapshot(snap: ReplanSnapshot) -> str:
         for e in snap.plan:
             force = " [强制]" if e.forced else ""
             rel = f"第 {e.time.relative} 分钟后" if e.time.relative > 0 else "立即"
+            if e.tte_at_swap is None:
+                margin = "打烊前不断电"
+            elif e.tte_at_swap == 0:
+                margin = "换电时已在截止电压"
+            else:
+                margin = f"不换电余 {e.tte_at_swap:.0f} 分钟"
             lines.append(
                 f"     {e.time.clock}（绝对 {e.time.absolute}，{rel}）"
-                f" {e.mic_id}  {e.reason}  备电≥{e.min_spare_soc:.0%}{force}")
+                f" {e.mic_id}  {e.reason}  备电≥{e.min_spare_soc:.0%}{force}"
+                f"  [{margin}]")
             if e.related_alert:
                 lines.append(f"       └ 关联预警: {e.related_alert}")
     else:

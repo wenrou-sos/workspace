@@ -2,7 +2,8 @@
 import unittest
 
 from mic_scheduler.models import (Battery, Microphone, UsageSegment, MicState,
-                                  ChargingPool, Scene, SLOT_BALANCED, SLOT_READINESS)
+                                  ChargingPool, Scene, PlannedSwap,
+                                  SLOT_BALANCED, SLOT_READINESS)
 from mic_scheduler.battery import (time_to_empty, CUTOFF_SOC,
                                    drain_one_minute, charge_one_minute)
 from mic_scheduler.pool import charge_one_minute as pool_tick, USABLE_SOC
@@ -429,12 +430,136 @@ class ReportTest(unittest.TestCase):
         sc, _, _, reporter, _ = _replan_snapshot(
             [mic("A", 0.0, end=300)], spares=(0.02,), slots=1, horizon=300)
         # 校验中断电发生在第 0 分钟（开班即死），手动登记实际断电
-        reporter.record_outage(0, "A", 0)
+        reporter.record_outage(0, "A")
         text = render_report(reporter.finalize(sc))
         self.assertIn("最终断电统计", text)
         self.assertIn("开班已断电 1 起", text)
         self.assertIn("重排记录", text)
         self.assertIn("未解决的备电不足", text)
+
+    def test_rescued_mic_second_outage_is_in_service(self):
+        """0% 麦先换入 10% 电池获救，约25分钟后再断电：算营业中断电而非开班断电。
+
+        回归点：初始低电集合只按编号保存、且登记时把事件分钟同时当作
+        当前时间（minute <= now 恒真），导致获救后的新断电被多记为
+        初始故障、少记营业中断电。
+        """
+        from mic_scheduler.engine import do_swap, step
+        mics = [Microphone("A", Battery("BA", 0.0),
+                           [UsageSegment(0, 600, MicState.IN_USE)])]
+        sc = scene(mics, spares=(0.10,), slots=1, horizon=600, peak=())
+        reporter = DispatchReporter(sc)
+        plan, adv = SwapPlanner().replan(sc)
+        reporter.record_replan(sc, plan, adv, TRIGGER_INITIAL)
+
+        ok, _ = do_swap(sc, 0, "A", plan[0].min_spare_soc)
+        self.assertTrue(ok)
+        reporter.mark_rescued("A")  # 成功换入可开机电池
+
+        second = None
+        for t in range(0, 600):
+            sc.now = t
+            step(sc, t)
+            if sc.mic("A").dead_at == t:
+                second = reporter.record_outage(t, "A")
+                break
+        self.assertIsNotNone(second)
+        self.assertGreater(second.time.absolute, 0)   # 不是开班时刻
+        self.assertFalse(second.initial)             # 关键：获救后的新断电
+
+        outages = reporter.finalize(sc).outages
+        self.assertEqual(len(outages), 1)
+        self.assertFalse(outages[0].initial)
+        text = render_report(reporter.finalize(sc))
+        self.assertIn("开班已断电 0 起", text)
+        self.assertIn("营业中断电 1 起", text)
+
+    def test_initial_outage_without_rescue_stays_initial(self):
+        """开班即死且从未获救：无论用哪个 now 登记都保持 initial=True。
+
+        回归点：旧判定 minute <= now 依赖登记时刻；改用显式获救状态后，
+        登记时传入的 now 只影响相对时间展示、不影响分类。
+        """
+        mics = [Microphone("D", Battery("BD", 0.0),
+                           [UsageSegment(0, 600, MicState.IN_USE)])]
+        sc = scene(mics, spares=(), slots=1, horizon=600, peak=())
+        reporter = DispatchReporter(sc)
+        # 即便在较晚时刻补登记这条开班断电，分类仍是初始故障
+        rec = reporter.record_outage(0, "D", now=120)
+        self.assertTrue(rec.initial)
+        self.assertEqual(rec.time.relative, -120)  # now 仅用于相对展示
+
+    def test_normal_mic_outage_is_not_initial(self):
+        """普通低电麦（开班有电）运营中耗尽：initial=False。"""
+        from mic_scheduler.engine import step
+        mics = [Microphone("L", Battery("BL", 0.10),
+                           [UsageSegment(0, 600, MicState.IN_USE)])]
+        sc = scene(mics, spares=(), slots=1, horizon=600, peak=())
+        reporter = DispatchReporter(sc)
+        for t in range(0, 600):
+            sc.now = t
+            step(sc, t)
+            if sc.mic("L").dead_at == t:
+                rec = reporter.record_outage(t, "L")
+                self.assertFalse(rec.initial)
+                break
+        else:
+            self.fail("未发生断电")
+
+    def test_tte_at_swap_is_nonnegative_remaining_minutes(self):
+        """tte_at_swap 必须是非负剩余分钟（=绝对断电时刻-换电时刻）。
+
+        回归点：① 误用"换电时刻-断电时刻"得到负值（如 -60.2）；
+        ② 直接拿当前电量从未来换电时刻积分，漏掉中间耗电而高估续航。
+        """
+        # 构造"第60分钟换电、不换电约第120分钟断电"：soc0 = .03 + 120/360
+        soc0 = CUTOFF_SOC + 120 / 360
+        mics = [Microphone("A", Battery("BA", soc0),
+                           [UsageSegment(0, 600, MicState.IN_USE)])]
+        sc = scene(mics, spares=(1.0, 1.0), slots=2, horizon=600, peak=())
+        fake = [PlannedSwap(60, "A", "常规", USABLE_SOC)]
+        snap = DispatchReporter(sc).record_replan(
+            sc, fake, [], TRIGGER_INITIAL)
+        value = snap.plan[0].tte_at_swap
+        self.assertIsNotNone(value)
+        self.assertGreaterEqual(value, 0)
+        self.assertAlmostEqual(value, 60, delta=1)  # 非负、约 60 分钟余量
+
+    def test_tte_at_swap_zero_and_none_edges(self):
+        """换电时已在截止电压 -> 0；打烊前不断电 -> None。"""
+        # 初始死麦立即换机：剩余 0
+        mics = [Microphone("C", Battery("BC", 0.0),
+                           [UsageSegment(0, 600, MicState.IN_USE)])]
+        sc = scene(mics, spares=(1.0,), slots=1, horizon=600, peak=())
+        plan, _ = SwapPlanner().replan(sc)
+        snap = DispatchReporter(sc).record_replan(
+            sc, plan, [], TRIGGER_INITIAL)
+        first = snap.plan[0]
+        self.assertEqual(first.time.absolute, 0)
+        self.assertEqual(first.tte_at_swap, 0)
+
+        # 短营业 + 满电：打烊前不断电 -> None
+        mics2 = [Microphone("B", Battery("BB", 1.0),
+                            [UsageSegment(0, 120, MicState.IN_USE)])]
+        sc2 = scene(mics2, spares=(1.0,), slots=1, horizon=120, peak=())
+        snap2 = DispatchReporter(sc2).record_replan(
+            sc2, [PlannedSwap(60, "B", "常规", USABLE_SOC)], [],
+            TRIGGER_INITIAL)
+        self.assertIsNone(snap2.plan[0].tte_at_swap)
+
+    def test_tte_at_swap_accounts_for_drain_before_swap(self):
+        """换电时刻较晚时，剩余余量必须扣减 now->换电时刻之间的耗电。"""
+        # 1/3 电量：从现在起约 109 分钟到截止；第 60 分钟换电时只剩约 49
+        mics = [Microphone("A", Battery("BA", 1 / 3),
+                           [UsageSegment(0, 600, MicState.IN_USE)])]
+        sc = scene(mics, spares=(1.0, 1.0), slots=2, horizon=600, peak=())
+        snap = DispatchReporter(sc).record_replan(
+            sc, [PlannedSwap(60, "A", "常规", USABLE_SOC)], [],
+            TRIGGER_INITIAL)
+        value = snap.plan[0].tte_at_swap
+        self.assertIsNotNone(value)
+        self.assertGreaterEqual(value, 0)
+        self.assertAlmostEqual(value, 49, delta=1)  # 而非漏掉耗电的 ~109
 
 
 if __name__ == "__main__":
