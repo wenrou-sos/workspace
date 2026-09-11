@@ -48,6 +48,9 @@ def time_to_empty(mic: Microphone, start: int, horizon: int) -> float | None:
     CUTOFF_SOC 的分钟数（可为小数）；horizon 内不会断电则返回 None。
     """
     soc = mic.battery.soc
+    if soc <= CUTOFF_SOC:
+        # 起始时刻已经低于保护截止电压：TTE 为 0（不返回负值/过去时刻）
+        return float(start)
     for t in range(start, horizon):
         rate = drain_rate(mic, mic.state_at(t))
         soc -= rate

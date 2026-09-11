@@ -102,6 +102,15 @@ class Scene:
     peak_bands: list[tuple[int, int]]   # 营业高峰时段
     now: int = 0
 
+    def __post_init__(self) -> None:
+        # 开班（场景创建）时电量已低于保护截止电压的麦，直接登记为当前时刻
+        # 断电。否则 dead_at=None 的它会被当作正常设备参与排程，而仿真主循环
+        # 只记录"首次跌破阈值"的事件，任何时刻都不会再为它补登记。
+        from .battery import CUTOFF_SOC  # 函数内导入：避免 models <-> battery 循环依赖
+        for m in self.mics:
+            if m.dead_at is None and m.battery.soc <= CUTOFF_SOC:
+                m.dead_at = self.now
+
     def mic(self, mic_id: str) -> Microphone:
         for m in self.mics:
             if m.mic_id == mic_id:

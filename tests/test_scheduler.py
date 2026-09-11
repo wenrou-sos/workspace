@@ -16,12 +16,12 @@ def mic(mid, soc, start=0, end=600, health=1.0, state=MicState.IN_USE):
                       [UsageSegment(start, end, state)])
 
 
-def scene(mics, spares=(), slots=3, horizon=600, peak=((300, 420),)):
+def scene(mics, spares=(), slots=3, horizon=600, peak=((300, 420),), now=0):
     pool = ChargingPool(slots,
                         [Battery(f"S{i}", s) for i, s in enumerate(spares)])
     for b in pool.batteries:
-        b.enqueued_at = 0
-    return Scene(mics, pool, horizon, list(peak), now=0)
+        b.enqueued_at = now
+    return Scene(mics, pool, horizon, list(peak), now=now)
 
 
 class BatteryModelTest(unittest.TestCase):
@@ -142,6 +142,79 @@ class PlannerTest(unittest.TestCase):
         r = simulate(sc, plan2)
         self.assertEqual(r.failed, [])
         self.assertEqual(r.outages, [])
+
+    def test_initial_dead_mic_is_registered_at_creation(self):
+        """场景创建时电量已低于保护截止电压：立即登记为断电，而不是 None。"""
+        m = mic("DEAD", 0.0)
+        sc = scene([m], spares=(1.0,))
+        self.assertEqual(m.dead_at, 0)
+        m2 = mic("DEAD2", CUTOFF_SOC)
+        sc2 = scene([m2], now=50, spares=(1.0,))
+        self.assertEqual(m2.dead_at, 50)
+
+    def test_initial_dead_mic_gets_immediate_swap(self):
+        """开班即低电的麦必须在第 0 分钟安排换机，且计划执行后零断电。"""
+        build = lambda: scene(
+            [mic("D0", 0.0, end=600), mic("OK", 0.50, end=600)],
+            spares=(1.0,), slots=1, horizon=600, peak=())
+        plan, advisories = SwapPlanner().replan(build())
+        first = [s for s in plan if s.mic_id == "D0"]
+        self.assertTrue(first, f"开班即断电的麦未被排程: {advisories}")
+        self.assertEqual(first[0].time, 0)
+        r = simulate(build(), plan)
+        self.assertEqual(r.outages, [])
+        self.assertEqual(r.failed, [])
+
+    def test_initial_dead_two_mics_one_spare(self):
+        """两支开班即断电、只有一块满电：一支立即得救，另一支如实告警登记断电。"""
+        build = lambda: scene(
+            [mic("D0", 0.0, end=300), mic("D1", 0.0, end=300)],
+            spares=(1.0,), slots=1, horizon=300, peak=())
+        plan, advisories = SwapPlanner().replan(build())
+        self.assertEqual([(s.time, s.mic_id) for s in plan], [(0, "D0")])
+        self.assertTrue(any("截止电压" in a and "没有任何可换电池" in a
+                            for a in advisories))
+        r = simulate(build(), plan)
+        self.assertEqual(r.outages, [(0, "D1")])
+
+    def test_junk_spare_is_not_fake_rescue(self):
+        """池中唯一备电同样低于截止电压：不允许死电换死电的无效/重复换机。"""
+        build = lambda: scene([mic("D0", 0.0, end=600)],
+                              spares=(CUTOFF_SOC * 0.5,), slots=1,
+                              horizon=600, peak=())
+        plan, advisories = SwapPlanner().replan(build())
+        self.assertEqual(plan, [])
+        self.assertTrue(any("截止电压" in a for a in advisories))
+        r = simulate(build(), plan)
+        self.assertEqual(r.outages, [(0, "D0")])
+
+    def test_weak_rescue_then_second_swap(self):
+        """立即换入的电池电量不高（10%）：先救急，之后再次断电时继续安排换机。"""
+        build = lambda: scene([mic("D0", 0.0, end=600)],
+                              spares=(0.10,), slots=1, horizon=600, peak=())
+        plan, _ = SwapPlanner().replan(build())
+        self.assertTrue(plan)
+        self.assertEqual(plan[0].time, 0)
+        self.assertTrue(plan[0].forced)
+        self.assertGreaterEqual(len(plan), 2)  # 弱电池撑不到打烊，需二次换机
+        r = simulate(build(), plan)
+        self.assertEqual(r.outages, [])
+        self.assertEqual(r.failed, [])
+
+    def test_replan_when_mic_already_dead_mid_run(self):
+        """重排发生在某麦实际断电之后：也必须在当前时刻立即安排救援。"""
+        sc = scene([mic("D0", 0.10, end=600), mic("OK", 0.90, end=600)],
+                   spares=(1.0,), slots=1, horizon=600, peak=())
+        from mic_scheduler.engine import step
+        for t in range(0, 60):
+            step(sc, t)
+        sc.now = 60
+        self.assertIsNotNone(sc.mic("D0").dead_at)
+        self.assertLess(sc.mic("D0").dead_at, 60)
+        plan, _ = SwapPlanner().replan(sc)
+        d0 = [s for s in plan if s.mic_id == "D0"]
+        self.assertTrue(d0)
+        self.assertEqual(d0[0].time, 60)
 
 
 class MonitorTest(unittest.TestCase):

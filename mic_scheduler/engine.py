@@ -84,9 +84,9 @@ def simulate(scene: Scene, plan: list[PlannedSwap],
             elif must:
                 result.failed.append((minute, mic_id))
                 result.event_log.append((minute, f"⚠ {mic_id} 临时换机失败：无达标备电"))
-        # 2) 计划内换电（强制换机兜底取池中最高电量电池）
+        # 2) 计划内换电（强制换机兜底取池中能让麦开机的最高电量电池）
         for swap in by_time.get(minute, []):
-            threshold = 0.0 if swap.forced else swap.min_spare_soc
+            threshold = CUTOFF_SOC if swap.forced else swap.min_spare_soc
             ok, uid = do_swap(scene, minute, swap.mic_id, threshold)
             if ok:
                 result.executed.append((minute, swap.mic_id, uid, False))

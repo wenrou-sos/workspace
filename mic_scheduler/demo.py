@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from .battery import time_to_empty
+from .battery import time_to_empty, CUTOFF_SOC
 from .models import (Battery, Microphone, UsageSegment, MicState,
                      ChargingPool, Scene, SLOT_READINESS)
 from .engine import do_swap, step
@@ -94,7 +94,7 @@ def run_demo() -> None:
         if minute == EVENT_SWAP:
             # 客人坚持要换：优先满电，没有就取池中电量最高的（半电也先满足），
             # 随后立即重排，让系统自己消化这块半电带来的连锁影响。
-            threshold = 0.8 if scene.pool.ready_count(0.8) else 0.0
+            threshold = 0.8 if scene.pool.ready_count(0.8) else CUTOFF_SOC
             ok, uid = do_swap(scene, minute, "M2", threshold)
             if ok:
                 kind = "满电" if threshold == 0.8 else "电量最高的备电"
@@ -134,7 +134,7 @@ def run_demo() -> None:
             if s.time == minute and (s.time, s.mic_id) not in planned_done:
                 planned_done.add((s.time, s.mic_id))
                 ok, uid = do_swap(scene, minute, s.mic_id,
-                                  0.0 if s.forced else s.min_spare_soc)
+                                  CUTOFF_SOC if s.forced else s.min_spare_soc)
                 if ok:
                     timeline.append((minute, f"计划换机 {s.mic_id} -> {uid}（{s.reason}）"))
                 else:

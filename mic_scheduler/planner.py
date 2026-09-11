@@ -13,8 +13,11 @@
    真正加进计划后做一次完整重放——只有按顺序执行时确实能取到达标
    备电、且不挤掉其他已排换机，才算可行。这样可以消除"计划各自可行、
    合在一起抢电池"导致的连锁降级。
-5. 备电分三档：满电(80%) / 应急半电(50%) / 强制换机(取池中最高电量)，
-   模拟"备电紧张也不能让包厢断电"。
+5. 备电分三档：满电(80%) / 应急半电(50%) / 强制换机(取池中电量最高、
+   且高于截止电压、能让麦真正开机的电池)，模拟"备电紧张也不能让包厢断电"；
+   低于截止电压的死电不具备救援资格，防止"死电换死电"的假救援被排进计划。
+   开班（场景创建）时就已低于截止电压的麦由 Scene 直接登记为即时断电，
+   在这里得到 t=now 的立即换电安排。
 6. 重复 1~5 直到无人会断电。
 """
 from __future__ import annotations
@@ -47,19 +50,44 @@ def _simulate(sim: Scene, by_time: dict[int, list[PlannedSwap]]):
     deaths: list[tuple[int, str]] = []
     failed: list[tuple[int, str]] = []
 
+    # 重排可能发生在某支麦实际断电之后（仿真已推进、现场直接重建等情况）：
+    # 此刻仍低于截止电压且未被换走的麦，按"现在就要救"处理，
+    # 否则它的 dead_at 是过去时刻，永远不会出现在快放的断电事件里。
+    for m in sim.mics:
+        if (m.dead_at is not None and m.dead_at <= sim.now
+                and m.battery.soc <= CUTOFF_SOC):
+            m.dead_at = sim.now
+
+    # 每支麦"快放中是否曾在阈值之上活着"：开班即低电且从未被救活的麦，
+    # 其初始断电只登记一次——若第 0 分钟换机换进来的同样是死电（假救援），
+    # 不能反复当成新断电给同一支麦重复排换机；真正救活后再次跌破的，
+    # 属于正常的新断电事件，照常入 EDF 队列。
+    ever_alive = {m.mic_id: m.battery.soc > CUTOFF_SOC for m in sim.mics}
+
     for t in range(sim.now, sim.horizon):
         pre = {m.mic_id: m.battery.soc for m in sim.mics}
         pre_soc[t] = pre
         for swap in sorted(by_time.get(t, []), key=lambda s: s.mic_id):
-            threshold = 0.0 if swap.forced else swap.min_spare_soc
+            # 强制换机取池中能让麦开机的最高电量电池：阈值是截止电压而非 0，
+            # 否则换进来一块同样低于截止电压的死电，等于没有救援
+            threshold = CUTOFF_SOC if swap.forced else swap.min_spare_soc
             ok, _ = do_swap(sim, t, swap.mic_id, threshold)
             if not ok:
                 failed.append((t, swap.mic_id))
                 if sim.pool.batteries:  # 强制兜底：取池中电量最高的电池
-                    do_swap(sim, t, swap.mic_id, 0.0)
+                    do_swap(sim, t, swap.mic_id, CUTOFF_SOC)
         step(sim, t)
         for m in sim.mics:
-            if m.dead_at == t and pre[m.mic_id] > CUTOFF_SOC:
+            if m.battery.soc > CUTOFF_SOC:
+                ever_alive[m.mic_id] = True
+                continue  # 这一分钟的换机把它救活了（或本就活着）
+            if m.dead_at != t:
+                continue
+            if ever_alive[m.mic_id]:
+                # 曾经活着 -> 本分钟首次跌破截止电压
+                deaths.append((t, m.mic_id))
+            elif t == sim.now:
+                # 快放开始时就已断电、且立即换机也没救活：初始登记一次
                 deaths.append((t, m.mic_id))
     return pre_soc, deaths, failed
 
@@ -122,9 +150,14 @@ class SwapPlanner:
                 earliest, committed_times, advisories,
             )
             if swap is None:
-                advisories.append(
-                    f"{mic_id} 将在第 {deadline - scene.now} 分钟后断电，"
-                    f"但没有任何可行换机时刻（备电严重不足）")
+                if deadline <= scene.now:
+                    advisories.append(
+                        f"{mic_id} 电量已低于保护截止电压，"
+                        f"但没有任何可换电池（备电严重不足）")
+                else:
+                    advisories.append(
+                        f"{mic_id} 将在第 {deadline - scene.now} 分钟后断电，"
+                        f"但没有任何可行换机时刻（备电严重不足）")
                 break
             committed.append(swap)
 
@@ -134,29 +167,60 @@ class SwapPlanner:
 
     def _pick_swap(self, scene, committed, mic_id, deadline, earliest,
                    committed_times, advisories) -> PlannedSwap | None:
-        if deadline <= earliest:
+        already_dead = deadline <= scene.now
+        if already_dead:
+            # 现场创建时（或重排时刻）就已低于截止电压：只能立即换机，
+            # 不再受同麦换机间隔限制
+            earliest = scene.now
+        elif deadline <= earliest:
             earliest = scene.now  # 时间窗太紧：放宽同麦间隔限制
 
+        window = ([scene.now] if already_dead
+                  else list(range(earliest, deadline)))
+        if not window:
+            return None
+
         def candidates(threshold):
-            # 评分升序，逐个做完整重放验证（真正的全局顺序可行性）：
-            # 加入该候选后，整个计划不允许出现任何换机失败，
-            # 也不允许制造新的断电（它挤掉别人的电池也算不可行）。
-            base_deaths = len(_replay(scene, committed)[1])
+            # 评分升序，逐个做完整重放验证（真正的全局顺序可行性）。
+            # 可行条件：
+            #  1) 整个计划没有任何换机失败；
+            #  2) 其他麦不得出现原计划没有的断电时刻（不能靠抢别人的
+            #     电池救这支麦）；
+            #  3) 目标麦必须真正脱离本次断电——换入低于截止电压的死电
+            #     （死电换死电）时它仍在 t 时刻断电，属"假救援"，拒绝，
+            #     否则同一支麦会在同一分钟被反复安排无效换机；
+            #  4) 目标麦换电后不得比原截止时刻更早断电（防止换进一块
+            #     比它自身余电还差的电池反而缩短续航）。
+            _, base_deaths, _ = _replay(scene, committed)
+            base_by: dict[str, set[int]] = {}
+            for dt, dm in base_deaths:
+                base_by.setdefault(dm, set()).add(dt)
             ranked = sorted(
-                range(earliest, deadline),
+                window,
                 key=lambda x: _score(x, scene, committed_times),
             )
             for t in ranked:
-                trial = PlannedSwap(t, mic_id, "", threshold,
-                                    forced=(threshold == 0.0))
-                trial_plan = committed + [trial]
-                _, new_deaths, failed = _replay(scene, trial_plan)
-                if not failed and len(new_deaths) <= base_deaths:
-                    yield t
+                trial = PlannedSwap(t, mic_id, "", threshold, forced=False)
+                _, new_deaths, failed = _replay(scene, committed + [trial])
+                if failed:
+                    continue
+                new_by: dict[str, set[int]] = {}
+                for dt, dm in new_deaths:
+                    new_by.setdefault(dm, set()).add(dt)
+                target_times = new_by.pop(mic_id, set())
+                if t in target_times:
+                    continue  # 目标麦在 t 仍断电：假救援
+                if any(dt < deadline for dt in target_times):
+                    continue  # 换入电池比自身余电还差，死得更早
+                if any(not times <= base_by.get(other, set())
+                       for other, times in new_by.items()):
+                    continue  # 挤掉别的麦的电池，制造了新断电
+                yield t
 
         # 第一档：满电备电
         for t in candidates(USABLE_SOC):
-            return PlannedSwap(t, mic_id, "常规", USABLE_SOC)
+            reason = "立即换电" if already_dead and t == scene.now else "常规"
+            return PlannedSwap(t, mic_id, reason, USABLE_SOC)
 
         # 第二档：应急半电（备电确实紧张时）
         for t in candidates(EMERGENCY_SOC):
@@ -166,12 +230,18 @@ class SwapPlanner:
                 f"安排半电(≥{EMERGENCY_SOC:.0%})应急换机")
             return PlannedSwap(t, mic_id, tag, EMERGENCY_SOC)
 
-        # 第三档：断电前强制取池中电量最高的电池
-        for t in candidates(0.0):
-            advisories.append(
-                f"⚠ {mic_id} 预计第 {deadline - scene.now} 分钟后断电，"
-                f"届时无达标备电，强制使用池中最高电量电池")
-            return PlannedSwap(t, mic_id, "强制(备电不足)", 0.0, forced=True)
+        # 第三档：断电前强制取池中电量最高、且能让麦开机的电池
+        for t in candidates(CUTOFF_SOC):
+            if already_dead:
+                advisories.append(
+                    f"⚠ {mic_id} 电量已低于保护截止电压(≤{CUTOFF_SOC:.0%})，"
+                    f"立即强制使用池中最高电量电池")
+            else:
+                advisories.append(
+                    f"⚠ {mic_id} 预计第 {deadline - scene.now} 分钟后断电，"
+                    f"届时无达标备电，强制使用池中最高电量电池")
+            return PlannedSwap(t, mic_id, "强制(备电不足)", CUTOFF_SOC,
+                               forced=True)
         return None
 
     def _cluster_advice(self, committed, advisories, now: int = 0) -> None:
