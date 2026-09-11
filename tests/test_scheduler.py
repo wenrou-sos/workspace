@@ -12,7 +12,14 @@ from mic_scheduler.planner import SwapPlanner
 from mic_scheduler.monitor import Monitor, AlertLevel
 from mic_scheduler.report import (DispatchReporter, render_snapshot,
                                   render_report, TRIGGER_INITIAL,
-                                  TRIGGER_AD_HOC_SWAP, TRIGGER_DRAIN_SPIKE)
+                                  TRIGGER_AD_HOC_SWAP, TRIGGER_DRAIN_SPIKE,
+                                  TRIGGER_DEVICE_REPLACE,
+                                  KIND_PLANNED, KIND_AD_HOC,
+                                  RESULT_SUCCESS, RESULT_FAILED,
+                                  ST_EXECUTED, ST_FAILED, ST_CANCELLED,
+                                  ST_NOT_EXECUTED, ST_PENDING,
+                                  CAUSE_AD_HOC, CAUSE_DEVICE_REPLACE,
+                                  CAUSE_DRAIN_SPIKE)
 import json
 
 
@@ -560,6 +567,166 @@ class ReportTest(unittest.TestCase):
         self.assertIsNotNone(value)
         self.assertGreaterEqual(value, 0)
         self.assertAlmostEqual(value, 49, delta=1)  # 而非漏掉耗电的 ~109
+
+    # ---- 实际换电台账 / 计划-执行对账 ----
+    def test_swap_event_success_records_battery_uid(self):
+        """成功的计划内换电在终稿关联到条目，标记 executed 与实际电池 UID。"""
+        mics = [mic("A", 0.10, end=600)]
+        sc = scene(mics, spares=(1.0,), slots=1)
+        rep = DispatchReporter(sc)
+        plan = [PlannedSwap(60, "A", "常规", USABLE_SOC)]
+        rep.record_replan(sc, plan, [], TRIGGER_INITIAL)
+        ok, uid = do_swap(sc, 60, "A", USABLE_SOC)
+        self.assertTrue(ok)
+        rep.record_swap_execution(60, "A", KIND_PLANNED, RESULT_SUCCESS,
+                                  USABLE_SOC, reason="常规", battery_uid=uid)
+        # 成功记录内部已自动 mark_rescued
+        self.assertIn("A", rep._ever_rescued)
+        sc.now = 120
+        entry = rep.finalize(sc).snapshots[0].plan[0]
+        self.assertEqual(entry.execution, ST_EXECUTED)
+        self.assertEqual(entry.battery_uid, uid)
+        self.assertIn(uid, entry.execution_label)
+        ev = rep.finalize(sc).swap_events[0]
+        self.assertEqual(ev.kind, KIND_PLANNED)
+        self.assertEqual(ev.result, RESULT_SUCCESS)
+        self.assertEqual(ev.minute, 60)
+
+    def test_same_minute_contention_failure_is_distinguished(self):
+        """同一分钟两支麦抢一块备电：成功 vs 落空（failed）明确区分，
+        落空带失败分钟与原因，且不标记任何电池 UID。"""
+        mics = [mic("A", 0.10, end=600), mic("B", 0.11, end=600)]
+        sc = scene(mics, spares=(1.0,), slots=1, peak=())
+        rep = DispatchReporter(sc)
+        plan = [PlannedSwap(60, "A", "常规", USABLE_SOC),
+                PlannedSwap(60, "B", "常规", USABLE_SOC)]
+        rep.record_replan(sc, plan, [], TRIGGER_INITIAL)
+        ok, uid = do_swap(sc, 60, "A", USABLE_SOC)
+        rep.record_swap_execution(60, "A", KIND_PLANNED, RESULT_SUCCESS,
+                                  USABLE_SOC, "常规", battery_uid=uid)
+        ok2, _ = do_swap(sc, 60, "B", USABLE_SOC)
+        self.assertFalse(ok2)
+        rep.record_swap_execution(60, "B", KIND_PLANNED, RESULT_FAILED,
+                                  USABLE_SOC, "常规",
+                                  detail="同分钟备电被 A 抢占")
+        sc.now = 120
+        report = rep.finalize(sc)
+        st = {e.mic_id: e for e in report.snapshots[0].plan}
+        self.assertEqual(st["A"].execution, ST_EXECUTED)
+        self.assertEqual(st["B"].execution, ST_FAILED)
+        self.assertIsNone(st["B"].battery_uid)
+        self.assertIn("抢占", st["B"].execution_detail)
+        failed = [e for e in report.swap_events if e.result == RESULT_FAILED]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].minute, 60)
+        self.assertIsNone(failed[0].battery_uid)
+
+    def test_ad_hoc_swap_invalidates_old_plan(self):
+        """临时换机记录为 ad_hoc 事件，并把该麦旧计划标为 cancelled(ad_hoc)。"""
+        mics = [mic("A", 0.20, end=600), mic("B", 0.40, end=600)]
+        sc = scene(mics, spares=(1.0, 0.9), slots=2, peak=())
+        rep = DispatchReporter(sc)
+        p1, _ = SwapPlanner().replan(sc)
+        rep.record_replan(sc, p1, [], TRIGGER_INITIAL)
+        a_old = next(s.time for s in p1 if s.mic_id == "A")
+
+        # 第 10 分钟临时给 A 换满电
+        ok, uid = do_swap(sc, 10, "A", USABLE_SOC)
+        self.assertTrue(ok)
+        rep.record_swap_execution(10, "A", KIND_AD_HOC, RESULT_SUCCESS,
+                                  USABLE_SOC, "客人提前要求", battery_uid=uid)
+        sc.now = 10
+        p2, _ = SwapPlanner().replan(sc)
+        rep.record_replan(sc, p2, [], TRIGGER_AD_HOC_SWAP, "A 临时换机")
+
+        sc.now = 600
+        report = rep.finalize(sc)
+        # 临时事件本身在台账中、不绑定快照、带 UID
+        ad = [e for e in report.swap_events if e.kind == KIND_AD_HOC]
+        self.assertEqual(len(ad), 1)
+        self.assertEqual(ad[0].battery_uid, uid)
+        self.assertIsNone(ad[0].plan_seq)
+        # A 的旧条目被取消且原因码是 ad_hoc
+        a_cancel = [c for c in report.cancelled_plans
+                    if c.mic_id == "A" and c.planned_minute == a_old]
+        self.assertTrue(a_cancel)
+        self.assertEqual(a_cancel[0].cause_code, CAUSE_AD_HOC)
+        entry = next(e for s in report.snapshots for e in s.plan
+                     if s.seq == 1 and e.mic_id == "A"
+                     and e.time.absolute == a_old)
+        self.assertEqual(entry.execution, ST_CANCELLED)
+        self.assertEqual(entry.cancel_cause, CAUSE_AD_HOC)
+
+    def test_cancelled_cause_distinguishes_device_and_spike(self):
+        """换机身 -> device_replace；耗电突增 -> drain_spike；普通重排 -> replan。"""
+        mics = [mic("A", 0.30, end=600)]
+        sc = scene(mics, spares=(1.0, 1.0, 1.0), slots=3, peak=())
+        rep = DispatchReporter(sc)
+        p1, _ = SwapPlanner().replan(sc)
+        rep.record_replan(sc, p1, [], TRIGGER_INITIAL)
+        old = next(s.time for s in p1 if s.mic_id == "A")
+
+        # 换机身重排（现场无 ad_hoc 事件）
+        sc.now = 100
+        rep.record_replan(sc, p1, [], TRIGGER_DEVICE_REPLACE, "换机身")  # 计划未变则无取消
+        # 制造一条真实消失的条目：直接给一份新计划（A 换到别的分钟）
+        new_plan = [PlannedSwap(old + 50, "A", "常规", USABLE_SOC)]
+        rep.record_replan(sc, new_plan, [], TRIGGER_DEVICE_REPLACE, "换机身")
+        sc.now = 600
+        codes = {c.mic_id: c.cause_code for c in rep.finalize(sc).cancelled_plans}
+        self.assertEqual(codes.get("A"), CAUSE_DEVICE_REPLACE)
+
+        # 耗电突增场景单独再来一遍
+        sc2 = scene([mic("A", 0.30, end=600)],
+                    spares=(1.0, 1.0, 1.0), slots=3, peak=())
+        rep2 = DispatchReporter(sc2)
+        p21, _ = SwapPlanner().replan(sc2)
+        rep2.record_replan(sc2, p21, [], TRIGGER_INITIAL)
+        sc2.now = 100
+        sc2.mic("A").drain_scale = 3.0
+        p22, _ = SwapPlanner().replan(sc2)
+        rep2.record_replan(sc2, p22, [], TRIGGER_DRAIN_SPIKE, "2.2x")
+        sc2.now = 600
+        codes2 = {c.cause_code for c in rep2.finalize(sc2).cancelled_plans}
+        self.assertIn(CAUSE_DRAIN_SPIKE, codes2)
+
+    def test_not_executed_and_pending_status(self):
+        """计划时刻已过却无执行记录 -> not_executed；时刻未到 -> pending。"""
+        mics = [mic("A", 0.30, end=600)]
+        sc = scene(mics, spares=(1.0,), slots=1, peak=())
+        rep = DispatchReporter(sc)
+        rep.record_replan(sc, [PlannedSwap(30, "A", "常规", USABLE_SOC),
+                               PlannedSwap(300, "A", "常规", USABLE_SOC)],
+                           [], TRIGGER_INITIAL)
+        sc.now = 100
+        st = {e.time.absolute: e.execution
+              for e in rep.finalize(sc).snapshots[0].plan}
+        self.assertEqual(st[30], ST_NOT_EXECUTED)
+        self.assertEqual(st[300], ST_PENDING)
+
+    def test_swap_ledger_present_in_json(self):
+        """JSON 导出含 swap_events / cancelled_plans，字段可读。"""
+        mics = [mic("A", 0.10, end=600)]
+        sc = scene(mics, spares=(1.0,), slots=1)
+        rep = DispatchReporter(sc)
+        rep.record_replan(sc, [PlannedSwap(60, "A", "常规", USABLE_SOC)],
+                          [], TRIGGER_INITIAL)
+        ok, uid = do_swap(sc, 60, "A", USABLE_SOC)
+        rep.record_swap_execution(60, "A", KIND_PLANNED, RESULT_SUCCESS,
+                                  USABLE_SOC, "常规", battery_uid=uid)
+        sc.now = 120
+        data = rep.finalize(sc).to_dict()
+        self.assertIn("swap_events", data)
+        self.assertIn("cancelled_plans", data)
+        ev = data["swap_events"][0]
+        self.assertEqual(ev["battery_uid"], uid)
+        self.assertEqual(ev["kind"], KIND_PLANNED)
+        self.assertEqual(ev["result"], RESULT_SUCCESS)
+        self.assertEqual(ev["minute"], 60)
+        # 既有结构仍在且可读
+        self.assertIn("snapshots", data)
+        self.assertIn("outages", data)
+        json.dumps(data, ensure_ascii=False)  # 可序列化
 
 
 if __name__ == "__main__":

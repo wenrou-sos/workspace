@@ -18,7 +18,8 @@ from .planner import SwapPlanner
 from .monitor import Monitor
 from .report import (DispatchReporter, render_snapshot, render_report,
                      TRIGGER_INITIAL, TRIGGER_AD_HOC_SWAP,
-                     TRIGGER_DEVICE_REPLACE, TRIGGER_DRAIN_SPIKE)
+                     TRIGGER_DEVICE_REPLACE, TRIGGER_DRAIN_SPIKE,
+                     KIND_PLANNED, KIND_AD_HOC, RESULT_SUCCESS, RESULT_FAILED)
 
 OPEN = 18 * 60       # 仿真从 17:00 开始，18:00 开门
 CLOSE = 26 * 60      # 凌晨 02:00
@@ -94,13 +95,20 @@ def run_demo(export_path: str | None = None) -> None:
             threshold = 0.8 if scene.pool.ready_count(0.8) else CUTOFF_SOC
             ok, uid = do_swap(scene, minute, "M2", threshold)
             if ok:
-                reporter.mark_rescued("M2")
                 kind = "满电" if threshold == 0.8 else "电量最高的备电"
+                reporter.record_swap_execution(
+                    minute, "M2", KIND_AD_HOC, RESULT_SUCCESS, threshold,
+                    reason=f"客人提前要求（{kind}）", battery_uid=uid)
                 timeline.append((minute,
                     f"临时换机 M2 -> {uid}（客人提前要求，{kind}）"))
                 monitor.reset_dedup("M2")
                 plan, advisories = replan_and_report(
                     TRIGGER_AD_HOC_SWAP, f"M2 临时更换为 {uid}（{kind}）")
+            else:
+                reporter.record_swap_execution(
+                    minute, "M2", KIND_AD_HOC, RESULT_FAILED, threshold,
+                    reason="客人提前要求", detail="池中无任何可开机备电")
+                timeline.append((minute, "✗ M2 临时换机失败：无任何备电"))
 
         # --- 突发事件 2：设备故障，整支换掉（电池不换，转移到备用机身） ---
         if minute == EVENT_REPLACE:
@@ -128,12 +136,18 @@ def run_demo(export_path: str | None = None) -> None:
         for s in plan:
             if s.time == minute and (s.time, s.mic_id) not in planned_done:
                 planned_done.add((s.time, s.mic_id))
-                ok, uid = do_swap(scene, minute, s.mic_id,
-                                  CUTOFF_SOC if s.forced else s.min_spare_soc)
+                threshold = CUTOFF_SOC if s.forced else s.min_spare_soc
+                ok, uid = do_swap(scene, minute, s.mic_id, threshold)
                 if ok:
-                    reporter.mark_rescued(s.mic_id)
+                    reporter.record_swap_execution(
+                        minute, s.mic_id, KIND_PLANNED, RESULT_SUCCESS,
+                        threshold, reason=s.reason, battery_uid=uid)
                     timeline.append((minute, f"计划换机 {s.mic_id} -> {uid}（{s.reason}）"))
                 else:
+                    reporter.record_swap_execution(
+                        minute, s.mic_id, KIND_PLANNED, RESULT_FAILED,
+                        threshold, reason=s.reason,
+                        detail="计划时刻池中无任何可开机备电（可能被同分钟其他换机抢占）")
                     timeline.append((minute, f"✗ {s.mic_id} 换机失败：无任何备电"))
 
         # --- 耗电 / 充电推进 + 断电登记（仅登记一次） + 预警 ---

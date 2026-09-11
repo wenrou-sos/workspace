@@ -7,8 +7,17 @@
 - 场景时间：仿真绝对分钟、钟点、相对当前分钟、营业高峰；
 - 每支麦克风的预计断电（TTE，绝对 + 相对）与关联的预警 / 换电动作；
 - 换电计划：原因、备电阈值、计划时刻（绝对分钟 + 钟点 + 距当前）；
+- **实际换电台账**（:class:`SwapEvent`）：计划内/临时 × 成功/落空、
+  实际换上的电池 UID、落空发生在哪一分钟；终稿按 (绝对分钟, 麦) 把每条
+  计划与真实执行对账（已执行 / 落空 / 被取消 / 临时换机后失效 / 未执行）；
+- **计划取消台账**（:class:`CancelledPlan`）：按重排原因区分临时换机致旧
+  计划失效、换机身迁移、耗电突增提前、普通重排；
 - 未解决的备电不足（计划里没有换电条目的告警 / 校验后仍断电）；
 - 最终断电统计（开班已断电、营业中断电、各次重排快照留存）。
+
+注意区分两类"落空"：``validated_failed`` 是**影子仿真**对候选计划的预判，
+``SwapEvent(kind=planned, result=failed)`` 是主循环里**真实发生**的执行失败
+（如同一分钟多支麦抢占同一块备电）。
 
 时间表示一律双轨：``absolute`` 是仿真绝对分钟（可换算钟点），
 ``relative`` 是"距该快照生成时刻还有多少分钟"，二者不混用。
@@ -16,7 +25,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, is_dataclass
 
 from .battery import time_to_empty, predict_soc, CUTOFF_SOC
 from .engine import clone_scene, simulate
@@ -29,6 +38,25 @@ TRIGGER_AD_HOC_SWAP = "临时换机后重排"
 TRIGGER_DEVICE_REPLACE = "更换机身后重排"
 TRIGGER_DRAIN_SPIKE = "耗电突增后重排"
 TRIGGER_OTHER = "重排"
+
+# 真实换电动作的类型 / 结果
+KIND_PLANNED = "planned"   # 计划内换电
+KIND_AD_HOC = "ad_hoc"     # 临时换机（客人要求等，不在计划条目内）
+RESULT_SUCCESS = "success"
+RESULT_FAILED = "failed"
+
+# 计划条目终稿对账状态
+ST_EXECUTED = "executed"        # 已按计划执行
+ST_FAILED = "failed"            # 到点执行但落空（如同分钟抢占）
+ST_CANCELLED = "cancelled"      # 被后续重排取消（旧计划失效）
+ST_NOT_EXECUTED = "not_executed"  # 计划时刻已过，却没有任何执行记录
+ST_PENDING = "pending"          # 计划时刻尚未到
+
+# 计划取消原因码
+CAUSE_AD_HOC = "ad_hoc"
+CAUSE_DEVICE_REPLACE = "device_replace"
+CAUSE_DRAIN_SPIKE = "drain_spike"
+CAUSE_REPLAN = "replan"
 
 # 视为"未解决备电不足"的提示语关键词（来自 planner 兜底失败分支）
 _SHORTAGE_KEYWORDS = ("无满电备电", "备电严重不足", "无达标备电",
@@ -57,6 +85,40 @@ class PlanEntryView:
                                    # （非负：绝对断电时刻 - 换电时刻）；
                                    # 0 = 换电时已在截止电压；None = 打烊前不断电
     related_alert: str | None = None   # 关联的最近一条该麦预警文本
+    # —— 终稿按绝对分钟与实际执行对账后回填（快照生成时均为待执行）——
+    execution: str | None = None       # executed / failed / cancelled / pending / not_executed
+    execution_label: str = ""          # 可读取的执行状态文案
+    battery_uid: str | None = None     # 实际换上的电池 UID（成功时）
+    execution_detail: str = ""         # 落空原因等
+    cancel_cause: str = ""              # cancelled 时的机器可读原因码
+
+
+@dataclass
+class SwapEvent:
+    """一次真实发生的换电动作（区别于影子仿真校验）。"""
+    minute: int                    # 仿真绝对分钟（计划-执行据此关联）
+    clock: str
+    offset_from_start: int         # 距报告起点的分钟数
+    mic_id: str
+    kind: str                      # planned（计划内）/ ad_hoc（临时换机）
+    result: str                    # success / failed
+    battery_uid: str | None        # 实际换上的电池 UID；落空时为 None
+    threshold: float               # 当时要求的最低备电电量
+    reason: str                    # 计划原因或临时事件说明
+    detail: str                    # 落空原因等补充
+    plan_seq: int | None           # 计划内换电所属的重排快照序号
+
+
+@dataclass
+class CancelledPlan:
+    """一条因重排而作废、且从未执行的旧计划。"""
+    mic_id: str
+    planned_minute: int
+    clock: str
+    reason: str
+    removed_in_snapshot: int       # 在哪一次重排中被移除
+    cause_code: str                # ad_hoc / device_replace / drain_spike / replan
+    cause: str                     # 可读原因
 
 
 @dataclass
@@ -125,17 +187,13 @@ class DispatchReport:
     snapshots: list[ReplanSnapshot]
     outages: list[OutageRecord]
     alerts: list[dict]
+    swap_events: list[SwapEvent] = field(default_factory=list)
+    cancelled_plans: list[CancelledPlan] = field(default_factory=list)
 
     # ---- 导出 ----
     def to_dict(self) -> dict:
         def emit(obj):
-            if isinstance(obj, TimeRef):
-                return obj.as_dict()
-            if isinstance(obj, (PlanEntryView, MicForecast,
-                                UnresolvedShortage, OutageRecord,
-                                ReplanSnapshot)):
-                return {k: emit(v) for k, v in asdict(obj).items()}
-            if isinstance(obj, PlanDiff):
+            if is_dataclass(obj) and not isinstance(obj, type):
                 return {k: emit(v) for k, v in asdict(obj).items()}
             if isinstance(obj, list):
                 return [emit(v) for v in obj]
@@ -150,6 +208,10 @@ class DispatchReport:
             "snapshots": [emit(s) for s in self.snapshots],
             "outages": [emit(o) for o in self.outages],
             "alerts": self.alerts,
+            # 实际换电台账：计划内/临时、成功/落空、实际电池 UID
+            "swap_events": [emit(e) for e in self.swap_events],
+            # 计划取消台账：旧计划为何失效
+            "cancelled_plans": [emit(c) for c in self.cancelled_plans],
         }
 
     def to_json(self, path: str | None = None,
@@ -176,6 +238,12 @@ class DispatchReporter:
         self._alerts: list[Alert] = []
         self._outage_keys: set[tuple[int, str]] = set()
         self._outages: list[OutageRecord] = []
+        # 真实换电台账（主循环执行，不是影子仿真）
+        self._swap_events: list[SwapEvent] = []
+        # 因重排而作废的旧计划条目
+        self._cancelled: list[CancelledPlan] = []
+        # 报告起点（第一条快照的生成时刻），台账时间相对它显示
+        self._start_minute: int | None = None
         # 开班时已经低于截止电压的麦（用于断电分类）
         self._initial_dead = {m.mic_id for m in scene.mics
                               if m.battery.soc <= CUTOFF_SOC}
@@ -204,6 +272,38 @@ class DispatchReporter:
         由执行侧在每次成功换电（含临时换机）后调用。
         """
         self._ever_rescued.add(mic_id)
+
+    def record_swap_execution(self, minute: int, mic_id: str, kind: str,
+                              result: str, threshold: float, reason: str,
+                              battery_uid: str | None = None,
+                              detail: str = "") -> SwapEvent:
+        """登记一次【真实执行】的换电（区别于影子仿真的 validated_*）。
+
+        - kind=planned：计划内换机，自动关联当时生效的重排快照；
+        - kind=ad_hoc：临时换机（不对应任何计划条目，旧计划因此失效）；
+        - result=success 时自动 mark_rescued；failed 时 battery_uid=None，
+          detail 记录落空原因（如"同分钟无达标备电/被抢占"）。
+        """
+        if self._start_minute is None:
+            self._start_minute = minute
+        event = SwapEvent(
+            minute=minute,
+            clock=clock_of(minute, self.day_start_hour),
+            offset_from_start=minute - self._start_minute,
+            mic_id=mic_id,
+            kind=kind,
+            result=result,
+            battery_uid=battery_uid,
+            threshold=threshold,
+            reason=reason,
+            detail=detail,
+            plan_seq=(self._snapshots[-1].seq
+                      if kind == KIND_PLANNED and self._snapshots else None),
+        )
+        if result == RESULT_SUCCESS:
+            self.mark_rescued(mic_id)
+        self._swap_events.append(event)
+        return event
 
     def record_outage(self, minute: int, mic_id: str,
                       now: int | None = None) -> OutageRecord:
@@ -234,6 +334,15 @@ class DispatchReporter:
         """根据当前现场 + 计划生成一份快照并留存（含无备电/失败场景）。"""
         now = scene.now
         seq = len(self._snapshots) + 1
+        if self._start_minute is None:
+            self._start_minute = now
+
+        # 与上一版计划按 (麦, 绝对分钟) 对齐：新版不再包含、且当时尚未执行
+        # 的旧条目 = 因本次重排而取消（临时换机致旧计划失效 / 换机身迁移 /
+        # 耗电突增提前 / 普通重排）。
+        if self._snapshots:
+            self._detect_cancellations(self._snapshots[-1], plan, seq,
+                                       trigger, now)
 
         # 最近一次各麦预警文本（关联换电动作用）
         latest_alert: dict[str, str] = {}
@@ -400,17 +509,100 @@ class DispatchReporter:
         removed = [e for e in removed if key(e) not in used_rem]
         return PlanDiff(added=added, removed=removed, changed=changed)
 
+    # ---- 计划取消检测 ----
+    def _detect_cancellations(self, old_snap: ReplanSnapshot,
+                              new_plan: list[PlannedSwap], new_seq: int,
+                              trigger: str, now: int) -> None:
+        """新版计划里消失的旧条目 -> 取消台账（区分取消原因）。"""
+        new_keys = {(s.mic_id, s.time) for s in new_plan}
+        # 到本次重排前已真实执行/尝试过的 (麦,分钟)，不再算"取消"
+        happened = {(e.mic_id, e.minute) for e in self._swap_events}
+        ad_hoc_mics = {e.mic_id for e in self._swap_events
+                       if e.kind == KIND_AD_HOC}
+
+        for e in old_snap.plan:
+            key = (e.mic_id, e.time.absolute)
+            if key in new_keys or key in happened:
+                continue
+            cause_code, cause_txt = self._cancel_cause(
+                trigger, e.mic_id, e.mic_id in ad_hoc_mics)
+            self._cancelled.append(CancelledPlan(
+                mic_id=e.mic_id,
+                planned_minute=e.time.absolute,
+                clock=e.time.clock,
+                reason=e.reason,
+                removed_in_snapshot=new_seq,
+                cause_code=cause_code,
+                cause=cause_txt,
+            ))
+
+    @staticmethod
+    def _cancel_cause(trigger: str, mic_id: str,
+                      had_ad_hoc: bool) -> tuple[str, str]:
+        if trigger == TRIGGER_DEVICE_REPLACE:
+            return CAUSE_DEVICE_REPLACE, "更换机身，计划迁移重排"
+        if trigger == TRIGGER_DRAIN_SPIKE:
+            return CAUSE_DRAIN_SPIKE, "耗电突增，换电时刻重排"
+        if trigger == TRIGGER_AD_HOC_SWAP:
+            # 只有发生临时换机的那支麦算"临时换机后旧计划失效"，
+            # 其余被连带调整的条目归为临时事件引发的整体重排
+            if had_ad_hoc:
+                return CAUSE_AD_HOC, f"{mic_id} 临时换机后旧计划失效"
+            return CAUSE_REPLAN, "临时换机引发整体重排"
+        return CAUSE_REPLAN, "重排后旧计划失效"
+
     # ---- 终稿 ----
+    def _reconcile(self, scene: Scene):
+        """按 (绝对分钟, 麦) 把计划与真实执行对账，返回带标注的快照副本。"""
+        import copy
+        now = scene.now
+        # 真实执行事件索引：(分钟, 麦) -> 计划内执行事件
+        planned_events: dict[tuple[int, str], SwapEvent] = {}
+        for ev in self._swap_events:
+            if ev.kind == KIND_PLANNED:
+                planned_events.setdefault((ev.minute, ev.mic_id), ev)
+        # 该 (麦,分钟) 的计划是否已被取消
+        cancel_index = {(c.mic_id, c.planned_minute): c for c in self._cancelled}
+
+        reconciled: list[ReplanSnapshot] = []
+        for snap in self._snapshots:
+            new_snap = copy.deepcopy(snap)
+            for e in new_snap.plan:
+                ev = planned_events.get((e.time.absolute, e.mic_id))
+                cnl = cancel_index.get((e.mic_id, e.time.absolute))
+                if ev is not None:
+                    if ev.result == RESULT_SUCCESS:
+                        e.execution = ST_EXECUTED
+                        e.execution_label = f"已执行（换上 {ev.battery_uid}）"
+                        e.battery_uid = ev.battery_uid
+                    else:
+                        e.execution = ST_FAILED
+                        e.execution_label = f"落空（{ev.detail or '无达标备电'}）"
+                        e.execution_detail = ev.detail
+                elif cnl is not None:
+                    e.execution = ST_CANCELLED
+                    e.cancel_cause = cnl.cause_code
+                    e.execution_label = f"已取消（{cnl.cause}）"
+                    e.execution_detail = cnl.cause
+                elif e.time.absolute < now:
+                    e.execution = ST_NOT_EXECUTED
+                    e.execution_label = "未执行（计划时刻已过，无执行记录）"
+                else:
+                    e.execution = ST_PENDING
+                    e.execution_label = "待执行"
+            reconciled.append(new_snap)
+        return reconciled
+
     def finalize(self, scene: Scene) -> DispatchReport:
         now = scene.now
+        start = (self._start_minute
+                 if self._start_minute is not None else now)
         return DispatchReport(
-            scene_start=self._tref(self._snapshots[0].generated_at.absolute,
-                                   now) if self._snapshots
-            else self._tref(now, now),
+            scene_start=self._tref(start, now),
             horizon=self._tref(scene.horizon, now),
             peak_bands=self._band_clocks(scene),
             finalized_at=self._tref(now, now),
-            snapshots=list(self._snapshots),
+            snapshots=self._reconcile(scene),
             outages=list(self._outages),
             alerts=[{
                 "minute": a.minute,
@@ -420,6 +612,8 @@ class DispatchReporter:
                 "source": a.source,
                 "text": a.text,
             } for a in self._alerts],
+            swap_events=list(self._swap_events),
+            cancelled_plans=list(self._cancelled),
         )
 
 
@@ -475,6 +669,9 @@ def render_snapshot(snap: ReplanSnapshot) -> str:
                 f"     {e.time.clock}（绝对 {e.time.absolute}，{rel}）"
                 f" {e.mic_id}  {e.reason}  备电≥{e.min_spare_soc:.0%}{force}"
                 f"  [{margin}]")
+            # 终稿对账后的真实执行状态（即时渲染时尚未对账则不显示）
+            if e.execution and e.execution != ST_PENDING:
+                lines.append(f"       └ 执行: {e.execution_label}")
             if e.related_alert:
                 lines.append(f"       └ 关联预警: {e.related_alert}")
     else:
@@ -510,11 +707,54 @@ def render_report(report: DispatchReport) -> str:
 
     lines.append(f"\n重排记录（共 {len(report.snapshots)} 次，全部留存）:")
     for snap in report.snapshots:
+        # 该快照计划的终稿对账结果汇总
+        n_exec = sum(1 for e in snap.plan if e.execution == ST_EXECUTED)
+        n_fail = sum(1 for e in snap.plan if e.execution == ST_FAILED)
+        n_cancel = sum(1 for e in snap.plan if e.execution == ST_CANCELLED)
+        tail = []
+        if n_exec:
+            tail.append(f"已执行 {n_exec}")
+        if n_fail:
+            tail.append(f"落空 {n_fail}")
+        if n_cancel:
+            tail.append(f"取消 {n_cancel}")
+        tail_txt = ("，执行: " + " / ".join(tail)) if tail else ""
         lines.append(
             f"  #{snap.seq} {snap.generated_at.clock} [{snap.trigger}]"
             f" 计划 {len(snap.plan)} 次 / 未解决 {len(snap.unresolved)} 起"
-            f" / 校验断电 {snap.validated_outages} 起"
+            f" / 校验断电 {snap.validated_outages} 起{tail_txt}"
             + (f" — {snap.note}" if snap.note else ""))
+
+    # 实际换电台账（计划内/临时 × 成功/落空 + 实际电池 UID）
+    lines.append(f"\n实际换电台账（共 {len(report.swap_events)} 次）:")
+    if report.swap_events:
+        for ev in report.swap_events:
+            if ev.kind == KIND_AD_HOC:
+                kind_txt = "临时换机"
+                seq_txt = ""
+            else:
+                kind_txt = "计划内"
+                seq_txt = f" 快照#{ev.plan_seq}" if ev.plan_seq else ""
+            if ev.result == RESULT_SUCCESS:
+                res_txt = f"✓ 成功换上 {ev.battery_uid}（要求≥{ev.threshold:.0%}）"
+            else:
+                res_txt = f"✗ 落空：{ev.detail or '无达标备电'}"
+            lines.append(
+                f"  {ev.clock}（绝对 {ev.minute}，第 {ev.offset_from_start} 分钟）"
+                f" {ev.mic_id}  [{kind_txt}{seq_txt}] {res_txt}  ({ev.reason})")
+    else:
+        lines.append("  （无实际换电动作）")
+
+    # 计划取消台账（旧计划为何失效）
+    lines.append(f"\n计划取消台账（共 {len(report.cancelled_plans)} 条）:")
+    if report.cancelled_plans:
+        for c in report.cancelled_plans:
+            lines.append(
+                f"  {c.clock}（绝对 {c.planned_minute}） {c.mic_id} "
+                f"{c.reason} -> 于快照#{c.removed_in_snapshot} 取消"
+                f" [{c.cause}]")
+    else:
+        lines.append("  ✓ 无旧计划被取消")
 
     # 相邻快照差异
     for i in range(1, len(report.snapshots)):

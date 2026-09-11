@@ -9,7 +9,7 @@
 ```bash
 python3 -m mic_scheduler.demo                    # 端到端演示（含 3 类突发事件）
 python3 -m mic_scheduler.demo report.json        # 同上，并导出结构化调度报告 JSON
-python3 -m unittest discover -s tests -v         # 单元测试（30 个）
+python3 -m unittest discover -s tests -v         # 单元测试（42 个）
 ```
 
 ## 演示场景
@@ -79,7 +79,19 @@ python3 -m unittest discover -s tests -v         # 单元测试（30 个）
 - `DispatchReporter.diff(旧快照, 新快照)` 按 `(麦, 绝对分钟)` 对齐，给出
   临时换机/耗电突增前后的换机时刻**位移、新增、取消**（绝对分钟对齐，
   不受 `now` 漂移影响）；
-- 终稿含最终断电统计（区分"开班已断电"与"营业中断电"）；
+- **计划与实际执行分账、按绝对分钟对账**：`record_swap_execution` 登记
+  每一次真实换电——`kind=planned/ad_hoc`（计划内/临时）× `result=
+  success/failed`，含**实际换上的电池 UID、要求阈值、落空分钟与原因**
+  （成功时自动标记该麦获救）。终稿把每条计划对账为：`executed`（已执行，
+  带 UID）/ `failed`（到点落空，如同分钟抢占）/ `cancelled`（旧计划被
+  重排取消）/ `not_executed`（时刻已过无记录）/ `pending`；
+- **计划取消台账**单独区分取消原因：临时换机致该麦旧计划失效
+  (`ad_hoc`)、换机身迁移 (`device_replace`)、耗电突增提前
+  (`drain_spike`)、连带整体重排 (`replan`)——"计划取消 / 同分钟抢占
+  失败 / 临时换机后旧计划失效"三类互不混淆。注意影子校验的
+  `validated_failed`（预判）与真实执行的 failed 事件是两回事；
+- 终稿含实际换电台账、计划取消台账与最终断电统计（区分"开班已断电"与
+  "营业中断电"）；
 - 文本渲染 `render_snapshot` / `render_report` 供终端复核，
   `report.to_json(path)` 导出归档（`python -m mic_scheduler.demo report.json`）。
 
